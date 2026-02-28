@@ -8,6 +8,7 @@ window.RollNotes.Views.RollDetail = (function() {
   var rollId = null;
   var filmStockDropdown = null;
   var locationDropdown = null;
+  var devScanDropdown = null;
 
   var ISO_OPTIONS = [
     'Box Speed', '6', '8', '12', '16', '20', '25', '32', '40', '50',
@@ -51,9 +52,8 @@ window.RollNotes.Views.RollDetail = (function() {
     // Location (searchable dropdown container)
     html += formGroup('Location', '<div id="locationContainer"></div>');
 
-    // Dev/Scan
-    html += formGroup('Dev / Scan',
-      '<input type="text" id="fieldDevScan" value="' + attr(roll.devScan) + '" placeholder="e.g. Carmencita, Film Lab Ams">');
+    // Dev/Scan (searchable dropdown container)
+    html += formGroup('Dev / Scan', '<div id="devScanContainer"></div>');
 
     // Notes
     html += formGroup('Notes',
@@ -80,6 +80,7 @@ window.RollNotes.Views.RollDetail = (function() {
     // Init searchable dropdowns
     initFilmStockDropdown(roll);
     initLocationDropdown(roll);
+    initDevScanDropdown(roll);
 
     bindEvents(roll);
   }
@@ -178,6 +179,23 @@ window.RollNotes.Views.RollDetail = (function() {
     });
   }
 
+  function initDevScanDropdown(roll) {
+    var options = RollNotes.LABS.map(function(lab) {
+      return { label: lab, value: lab };
+    });
+
+    devScanDropdown = RollNotes.SearchableDropdown.create({
+      container: document.getElementById('devScanContainer'),
+      options: options,
+      placeholder: 'Search labs or type custom...',
+      value: roll.devScan,
+      allowCustom: true,
+      onChange: function(val) {
+        RollNotes.AutoSave.save(rollId, 'devScan', val);
+      }
+    });
+  }
+
   function bindEvents(roll) {
     // Theme
     document.getElementById('fieldTheme').addEventListener('input', function() {
@@ -208,11 +226,6 @@ window.RollNotes.Views.RollDetail = (function() {
     // Date
     document.getElementById('fieldDate').addEventListener('change', function() {
       RollNotes.AutoSave.save(rollId, 'dateLoaded', this.value);
-    });
-
-    // Dev/Scan
-    document.getElementById('fieldDevScan').addEventListener('input', function() {
-      RollNotes.AutoSave.save(rollId, 'devScan', this.value);
     });
 
     // Notes
@@ -270,6 +283,7 @@ window.RollNotes.Views.RollDetail = (function() {
   function destroy() {
     if (filmStockDropdown) { filmStockDropdown.destroy(); filmStockDropdown = null; }
     if (locationDropdown) { locationDropdown.destroy(); locationDropdown = null; }
+    if (devScanDropdown) { devScanDropdown.destroy(); devScanDropdown = null; }
     if (container) container.innerHTML = '';
     container = null;
     rollId = null;

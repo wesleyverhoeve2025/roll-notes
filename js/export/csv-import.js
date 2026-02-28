@@ -21,15 +21,19 @@ window.RollNotes.CSVImport = (function() {
 
   function importFile(file, callback) {
     var reader = new FileReader();
-    reader.onload = function(e) {
+    reader.onload = async function(e) {
       var text = e.target.result;
       var rows = parseCSV(text);
       if (rows.length === 0) {
         callback({ imported: 0, skipped: 0, skippedIds: [] });
         return;
       }
-      var result = RollNotes.Store.importRolls(rows);
-      callback(result);
+      try {
+        var result = await RollNotes.Store.importRolls(rows);
+        callback(result);
+      } catch (err) {
+        callback({ imported: 0, skipped: 0, skippedIds: [], error: err.message });
+      }
     };
     reader.readAsText(file);
   }

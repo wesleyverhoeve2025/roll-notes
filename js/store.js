@@ -3,50 +3,142 @@ window.RollNotes = window.RollNotes || {};
 window.RollNotes.Store = (function() {
   'use strict';
 
-  var STORAGE_KEY = 'rollnotes_data';
+  var LOCAL_KEY = 'rollnotes_data';
   var data = null;
+  var sb = null;
+  var currentUserId = null;
+  var updateTimers = {};
 
   function generateId() {
-    return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+    return crypto.randomUUID();
   }
 
-  function init() {
-    var raw = localStorage.getItem(STORAGE_KEY);
-    if (raw) {
-      try { data = JSON.parse(raw); } catch (e) { data = null; }
-    }
-    if (!data) {
-      data = createDefaultData();
-      persist();
-    }
-  }
+  // ── DB ↔ JS mapping ──
 
-  function createDefaultData() {
-    var cameras = {};
-    RollNotes.DEFAULT_CAMERAS.forEach(function(cam) {
-      var id = 'cam_' + cam.prefix.toLowerCase();
-      cameras[id] = {
-        id: id,
-        name: cam.name,
-        prefix: cam.prefix,
-        startingRollNumber: 1,
-        currentRollNumber: 0,
-        createdAt: new Date().toISOString()
-      };
-    });
+  function mapCameraFromDb(row) {
     return {
-      version: 1,
-      settings: { isMember: false, customFilmStocks: [] },
-      cameras: cameras,
-      rolls: {}
+      id: row.id,
+      name: row.name,
+      prefix: row.prefix,
+      startingRollNumber: row.starting_number,
+      currentRollNumber: row.current_counter,
+      createdAt: row.created_at
     };
   }
 
-  function persist() {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+  function mapRollFromDb(row) {
+    var parts = (row.roll_id || '').split('_');
+    var rollNumber = parseInt(parts[parts.length - 1], 10) || 0;
+    return {
+      id: row.id,
+      cameraId: row.camera_id,
+      rollNumber: rollNumber,
+      rollDisplayId: row.roll_id,
+      rollTheme: row.roll_theme || '',
+      filmStock: row.film_stock || '',
+      freshExpired: (row.fresh_expired || 'Fresh').toLowerCase(),
+      expiryMonth: row.expiry_month || null,
+      expiryYear: row.expiry_year || null,
+      shotAtIso: row.shot_at_iso || 'Box Speed',
+      dateLoaded: row.date_loaded || '',
+      location: row.location || '',
+      devScan: row.dev_scan || '',
+      notes: row.notes || '',
+      createdAt: row.created_at,
+      updatedAt: row.updated_at
+    };
   }
 
-  // Cameras
+  // ── Init ──
+
+  async function init(userId) {
+    currentUserId = userId;
+    sb = RollNotes.Auth.getClient();
+
+    var results = await Promise.all([
+      sb.from('cameras').select('*'),
+      sb.from('rolls').select('*'),
+      sb.from('user_settings').select('*').maybeSingle(),
+      sb.from('custom_film_stocks').select('*')
+    ]);
+
+    var camerasRes = results[0];
+    var rollsRes = results[1];
+    var settingsRes = results[2];
+    var stocksRes = results[3];
+
+    if (camerasRes.error) throw camerasRes.error;
+    if (rollsRes.error) throw rollsRes.error;
+    if (stocksRes.error) throw stocksRes.error;
+
+    data = {
+      cameras: {},
+      rolls: {},
+      settings: {
+        isMember: false,
+        settingsId: null,
+        customFilmStocks: []
+      }
+    };
+
+    camerasRes.data.forEach(function(cam) {
+      data.cameras[cam.id] = mapCameraFromDb(cam);
+    });
+
+    rollsRes.data.forEach(function(roll) {
+      data.rolls[roll.id] = mapRollFromDb(roll);
+    });
+
+    if (settingsRes.data) {
+      data.settings.isMember = settingsRes.data.is_photo_club_member || false;
+      data.settings.settingsId = settingsRes.data.id;
+    }
+
+    data.settings.customFilmStocks = (stocksRes.data || []).map(function(s) {
+      return s.name;
+    });
+
+    // If user has zero cameras, seed with defaults
+    if (Object.keys(data.cameras).length === 0) {
+      await seedDefaultCameras();
+    }
+  }
+
+  async function seedDefaultCameras() {
+    var inserts = RollNotes.DEFAULT_CAMERAS.map(function(cam) {
+      return {
+        id: generateId(),
+        user_id: currentUserId,
+        name: cam.name,
+        prefix: cam.prefix,
+        starting_number: 1,
+        current_counter: 0
+      };
+    });
+
+    var res = await sb.from('cameras').insert(inserts).select();
+    if (res.error) throw res.error;
+
+    res.data.forEach(function(cam) {
+      data.cameras[cam.id] = mapCameraFromDb(cam);
+    });
+  }
+
+  async function refreshCache() {
+    if (currentUserId) await init(currentUserId);
+  }
+
+  // ── Error handling ──
+
+  function handleWriteError(error) {
+    console.error('Supabase write error:', error);
+    if (typeof RollNotes.toast === 'function') {
+      RollNotes.toast('Save failed \u2014 check your connection');
+    }
+  }
+
+  // ── Cameras (reads are sync from cache) ──
+
   function getCameras() {
     var arr = Object.values(data.cameras);
     arr.sort(function(a, b) { return a.name.localeCompare(b.name); });
@@ -58,36 +150,61 @@ window.RollNotes.Store = (function() {
   }
 
   function addCamera(name, prefix, startingRollNumber) {
-    var id = 'cam_' + generateId();
-    data.cameras[id] = {
+    var id = generateId();
+    var start = startingRollNumber || 1;
+    var cam = {
       id: id,
       name: name,
       prefix: prefix.toUpperCase(),
-      startingRollNumber: startingRollNumber || 1,
-      currentRollNumber: (startingRollNumber || 1) - 1,
+      startingRollNumber: start,
+      currentRollNumber: start - 1,
       createdAt: new Date().toISOString()
     };
-    persist();
-    return data.cameras[id];
+    data.cameras[id] = cam;
+
+    sb.from('cameras').insert({
+      id: id,
+      user_id: currentUserId,
+      name: name,
+      prefix: prefix.toUpperCase(),
+      starting_number: start,
+      current_counter: start - 1
+    }).then(function(res) {
+      if (res.error) handleWriteError(res.error);
+    });
+
+    return cam;
   }
 
   function updateCamera(cameraId, updates) {
     if (!data.cameras[cameraId]) return null;
     Object.assign(data.cameras[cameraId], updates);
-    persist();
+
+    var dbUpdates = {};
+    if (updates.name !== undefined) dbUpdates.name = updates.name;
+    if (updates.prefix !== undefined) dbUpdates.prefix = updates.prefix;
+    if (updates.startingRollNumber !== undefined) dbUpdates.starting_number = updates.startingRollNumber;
+
+    sb.from('cameras').update(dbUpdates).eq('id', cameraId).then(function(res) {
+      if (res.error) handleWriteError(res.error);
+    });
+
     return data.cameras[cameraId];
   }
 
   function deleteCamera(cameraId) {
     if (!data.cameras[cameraId]) return;
-    // Remove all rolls for this camera
     Object.keys(data.rolls).forEach(function(rollId) {
       if (data.rolls[rollId].cameraId === cameraId) {
         delete data.rolls[rollId];
       }
     });
     delete data.cameras[cameraId];
-    persist();
+
+    // Cascade handled by DB FK, just delete camera
+    sb.from('cameras').delete().eq('id', cameraId).then(function(res) {
+      if (res.error) handleWriteError(res.error);
+    });
   }
 
   function prefixExists(prefix, excludeCameraId) {
@@ -96,7 +213,8 @@ window.RollNotes.Store = (function() {
     });
   }
 
-  // Rolls
+  // ── Rolls (reads sync from cache) ──
+
   function getRolls(cameraId) {
     var arr = Object.values(data.rolls).filter(function(r) {
       return r.cameraId === cameraId;
@@ -135,70 +253,148 @@ window.RollNotes.Store = (function() {
     var cam = data.cameras[cameraId];
     if (!cam) return null;
     var rollNumber = cam.currentRollNumber + 1;
-    var id = 'roll_' + generateId();
-    data.rolls[id] = {
+    var id = generateId();
+    var displayId = formatRollId(cam.prefix, rollNumber);
+    var now = new Date().toISOString();
+    var today = now.split('T')[0];
+
+    var roll = {
       id: id,
       cameraId: cameraId,
       rollNumber: rollNumber,
-      rollDisplayId: formatRollId(cam.prefix, rollNumber),
+      rollDisplayId: displayId,
       rollTheme: '',
       filmStock: '',
       freshExpired: 'fresh',
       expiryMonth: null,
       expiryYear: null,
       shotAtIso: 'Box Speed',
-      dateLoaded: new Date().toISOString().split('T')[0],
+      dateLoaded: today,
       location: '',
       devScan: '',
       notes: '',
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
+      createdAt: now,
+      updatedAt: now
     };
+    data.rolls[id] = roll;
     cam.currentRollNumber = rollNumber;
-    persist();
-    return data.rolls[id];
+
+    // Insert roll + update camera counter
+    Promise.all([
+      sb.from('rolls').insert({
+        id: id,
+        user_id: currentUserId,
+        camera_id: cameraId,
+        roll_id: displayId,
+        fresh_expired: 'Fresh',
+        shot_at_iso: 'Box Speed',
+        date_loaded: today
+      }),
+      sb.from('cameras').update({ current_counter: rollNumber }).eq('id', cameraId)
+    ]).then(function(results) {
+      results.forEach(function(res) {
+        if (res.error) handleWriteError(res.error);
+      });
+    });
+
+    return roll;
   }
 
   function addRollWithNumber(cameraId, rollNumber) {
     var cam = data.cameras[cameraId];
     if (!cam) return null;
-    var id = 'roll_' + generateId();
-    data.rolls[id] = {
+    var id = generateId();
+    var displayId = formatRollId(cam.prefix, rollNumber);
+    var now = new Date().toISOString();
+    var today = now.split('T')[0];
+
+    var roll = {
       id: id,
       cameraId: cameraId,
       rollNumber: rollNumber,
-      rollDisplayId: formatRollId(cam.prefix, rollNumber),
+      rollDisplayId: displayId,
       rollTheme: '',
       filmStock: '',
       freshExpired: 'fresh',
       expiryMonth: null,
       expiryYear: null,
       shotAtIso: 'Box Speed',
-      dateLoaded: new Date().toISOString().split('T')[0],
+      dateLoaded: today,
       location: '',
       devScan: '',
       notes: '',
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
+      createdAt: now,
+      updatedAt: now
     };
+    data.rolls[id] = roll;
     if (rollNumber > cam.currentRollNumber) {
       cam.currentRollNumber = rollNumber;
     }
-    persist();
-    return data.rolls[id];
+
+    Promise.all([
+      sb.from('rolls').insert({
+        id: id,
+        user_id: currentUserId,
+        camera_id: cameraId,
+        roll_id: displayId,
+        fresh_expired: 'Fresh',
+        shot_at_iso: 'Box Speed',
+        date_loaded: today
+      }),
+      sb.from('cameras').update({ current_counter: cam.currentRollNumber }).eq('id', cameraId)
+    ]).then(function(results) {
+      results.forEach(function(res) {
+        if (res.error) handleWriteError(res.error);
+      });
+    });
+
+    return roll;
   }
 
   function updateRoll(rollId, updates) {
     if (!data.rolls[rollId]) return null;
     Object.assign(data.rolls[rollId], updates);
     data.rolls[rollId].updatedAt = new Date().toISOString();
-    persist();
+
+    // Debounced Supabase write (800ms, batches rapid keystrokes)
+    scheduleRollSync(rollId);
+
     return data.rolls[rollId];
   }
 
+  function scheduleRollSync(rollId) {
+    if (updateTimers[rollId]) clearTimeout(updateTimers[rollId]);
+    updateTimers[rollId] = setTimeout(function() {
+      var roll = data.rolls[rollId];
+      if (!roll) return;
+      sb.from('rolls').update({
+        roll_theme: roll.rollTheme || null,
+        film_stock: roll.filmStock || null,
+        fresh_expired: roll.freshExpired === 'expired' ? 'Expired' : 'Fresh',
+        expiry_month: roll.expiryMonth || null,
+        expiry_year: roll.expiryYear || null,
+        shot_at_iso: roll.shotAtIso || 'Box Speed',
+        date_loaded: roll.dateLoaded || null,
+        location: roll.location || null,
+        dev_scan: roll.devScan || null,
+        notes: roll.notes || null
+      }).eq('id', rollId).then(function(res) {
+        if (res.error) handleWriteError(res.error);
+      });
+      delete updateTimers[rollId];
+    }, 800);
+  }
+
   function deleteRoll(rollId) {
+    if (updateTimers[rollId]) {
+      clearTimeout(updateTimers[rollId]);
+      delete updateTimers[rollId];
+    }
     delete data.rolls[rollId];
-    persist();
+
+    sb.from('rolls').delete().eq('id', rollId).then(function(res) {
+      if (res.error) handleWriteError(res.error);
+    });
   }
 
   function getAllRolls() {
@@ -210,14 +406,35 @@ window.RollNotes.Store = (function() {
     return arr;
   }
 
-  // Settings
+  // ── Settings ──
+
   function getSettings() {
     return data.settings;
   }
 
   function updateSettings(updates) {
     Object.assign(data.settings, updates);
-    persist();
+
+    var dbUpdates = {};
+    if (updates.isMember !== undefined) dbUpdates.is_photo_club_member = updates.isMember;
+
+    if (data.settings.settingsId) {
+      sb.from('user_settings').update(dbUpdates).eq('id', data.settings.settingsId).then(function(res) {
+        if (res.error) handleWriteError(res.error);
+      });
+    } else {
+      // Create settings row
+      var newId = generateId();
+      sb.from('user_settings').insert({
+        id: newId,
+        user_id: currentUserId,
+        is_photo_club_member: updates.isMember || false
+      }).then(function(res) {
+        if (res.error) handleWriteError(res.error);
+        else data.settings.settingsId = newId;
+      });
+    }
+
     return data.settings;
   }
 
@@ -229,18 +446,26 @@ window.RollNotes.Store = (function() {
     if (!data.settings.customFilmStocks) data.settings.customFilmStocks = [];
     if (data.settings.customFilmStocks.indexOf(name) === -1) {
       data.settings.customFilmStocks.push(name);
-      persist();
+
+      sb.from('custom_film_stocks').insert({
+        user_id: currentUserId,
+        name: name
+      }).then(function(res) {
+        if (res.error) handleWriteError(res.error);
+      });
     }
   }
 
-  // Import
-  function importRolls(rolls) {
+  // ── Import (async — inserts to Supabase in batch) ──
+
+  async function importRolls(rows) {
     var imported = 0;
     var skipped = 0;
     var skippedIds = [];
+    var rollInserts = [];
+    var cameraUpdates = {};
 
-    rolls.forEach(function(row) {
-      // Find camera by prefix
+    rows.forEach(function(row) {
       var cam = Object.values(data.cameras).find(function(c) {
         return c.prefix.toUpperCase() === (row.camera_prefix || '').toUpperCase();
       });
@@ -250,7 +475,6 @@ window.RollNotes.Store = (function() {
         return;
       }
 
-      // Parse roll number from roll_id
       var parts = (row.roll_id || '').split('_');
       var rollNumber = parseInt(parts[parts.length - 1], 10);
       if (isNaN(rollNumber)) {
@@ -259,14 +483,13 @@ window.RollNotes.Store = (function() {
         return;
       }
 
-      // Check duplicate
       if (rollDisplayIdExists(cam.id, rollNumber)) {
         skipped++;
         skippedIds.push(row.roll_id);
         return;
       }
 
-      var id = 'roll_' + generateId();
+      var id = generateId();
       var freshExpired = (row.fresh_expired || '').toLowerCase() === 'expired' ? 'expired' : 'fresh';
       var expiryMonth = null;
       var expiryYear = null;
@@ -278,7 +501,7 @@ window.RollNotes.Store = (function() {
         }
       }
 
-      data.rolls[id] = {
+      var roll = {
         id: id,
         cameraId: cam.id,
         rollNumber: rollNumber,
@@ -297,18 +520,74 @@ window.RollNotes.Store = (function() {
         updatedAt: new Date().toISOString()
       };
 
+      data.rolls[id] = roll;
+
+      rollInserts.push({
+        id: id,
+        user_id: currentUserId,
+        camera_id: cam.id,
+        roll_id: roll.rollDisplayId,
+        roll_theme: roll.rollTheme || null,
+        film_stock: roll.filmStock || null,
+        fresh_expired: freshExpired === 'expired' ? 'Expired' : 'Fresh',
+        expiry_month: expiryMonth,
+        expiry_year: expiryYear,
+        shot_at_iso: roll.shotAtIso,
+        date_loaded: roll.dateLoaded || null,
+        location: roll.location || null,
+        dev_scan: roll.devScan || null,
+        notes: roll.notes || null
+      });
+
       if (rollNumber > cam.currentRollNumber) {
         cam.currentRollNumber = rollNumber;
+        cameraUpdates[cam.id] = rollNumber;
       }
+
       imported++;
     });
 
-    persist();
+    // Batch insert rolls
+    if (rollInserts.length > 0) {
+      var res = await sb.from('rolls').insert(rollInserts);
+      if (res.error) {
+        handleWriteError(res.error);
+        throw res.error;
+      }
+    }
+
+    // Update camera counters
+    var counterPromises = Object.keys(cameraUpdates).map(function(camId) {
+      return sb.from('cameras').update({ current_counter: cameraUpdates[camId] }).eq('id', camId);
+    });
+    if (counterPromises.length > 0) {
+      var results = await Promise.all(counterPromises);
+      results.forEach(function(res) {
+        if (res.error) handleWriteError(res.error);
+      });
+    }
+
     return { imported: imported, skipped: skipped, skippedIds: skippedIds };
+  }
+
+  // ── localStorage helpers (for migration check) ──
+
+  function hasLocalData() {
+    return !!localStorage.getItem(LOCAL_KEY);
+  }
+
+  function getLocalData() {
+    try { return JSON.parse(localStorage.getItem(LOCAL_KEY)); }
+    catch (e) { return null; }
+  }
+
+  function clearLocalData() {
+    localStorage.removeItem(LOCAL_KEY);
   }
 
   return {
     init: init,
+    refreshCache: refreshCache,
     getCameras: getCameras,
     getCamera: getCamera,
     addCamera: addCamera,
@@ -330,6 +609,9 @@ window.RollNotes.Store = (function() {
     updateSettings: updateSettings,
     getCustomFilmStocks: getCustomFilmStocks,
     addCustomFilmStock: addCustomFilmStock,
-    importRolls: importRolls
+    importRolls: importRolls,
+    hasLocalData: hasLocalData,
+    getLocalData: getLocalData,
+    clearLocalData: clearLocalData
   };
 })();

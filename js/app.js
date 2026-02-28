@@ -6,36 +6,111 @@ window.RollNotes = window.RollNotes || {};
   var Views = RollNotes.Views;
   var Router = RollNotes.Router;
   var Store = RollNotes.Store;
+  var Auth = RollNotes.Auth;
 
   var appMain = null;
+  var appHeader = null;
   var backBtn = null;
   var appTitle = null;
   var headerActions = null;
   var memberBadge = null;
   var toastEl = null;
   var toastTimer = null;
-
   var currentView = null;
+  var routesRegistered = false;
 
-  function init() {
+  async function init() {
     appMain = document.getElementById('appMain');
+    appHeader = document.getElementById('appHeader');
     backBtn = document.getElementById('backBtn');
     appTitle = document.getElementById('appTitle');
     headerActions = document.getElementById('headerActions');
     memberBadge = document.getElementById('memberBadge');
     toastEl = document.getElementById('toast');
 
-    Store.init();
-    RollNotes.Modal.init();
+    // Init Supabase client
+    Auth.init();
 
-    updateMemberBadge();
-
-    // Back button
-    backBtn.addEventListener('click', function() {
-      window.history.back();
+    // Listen for sign-out events
+    Auth.onAuthStateChange(function(event) {
+      if (event === 'SIGNED_OUT') {
+        window.location.reload();
+      }
     });
 
-    // Routes
+    // Check for existing session
+    showLoading(appMain);
+    var session = null;
+    try {
+      session = await Auth.getSession();
+    } catch (err) {
+      showError(appMain, 'Unable to connect. Please check your internet and try again.');
+      return;
+    }
+
+    if (!session) {
+      showLogin();
+    } else {
+      await loadApp(session.user);
+    }
+  }
+
+  function showLogin() {
+    appHeader.style.display = 'none';
+    Views.Login.render(appMain, {
+      onSuccess: async function(session) {
+        appHeader.style.display = '';
+        await loadApp(session.user);
+      }
+    });
+  }
+
+  async function loadApp(user) {
+    showLoading(appMain);
+
+    try {
+      // Check for localStorage migration
+      if (Store.hasLocalData()) {
+        appHeader.style.display = 'none';
+        await RollNotes.Migration.run(appMain, user.id);
+        appHeader.style.display = '';
+      }
+
+      // Load all data from Supabase
+      showLoading(appMain);
+      await Store.init(user.id);
+
+      RollNotes.Modal.init();
+      updateMemberBadge();
+
+      // Back button
+      backBtn.addEventListener('click', function() {
+        window.history.back();
+      });
+
+      // Register routes (only once)
+      if (!routesRegistered) {
+        registerRoutes();
+        routesRegistered = true;
+      }
+
+      // Refresh cache when tab becomes visible
+      document.addEventListener('visibilitychange', function() {
+        if (document.visibilityState === 'visible') {
+          Store.refreshCache().catch(function(err) {
+            console.error('Cache refresh failed:', err);
+          });
+        }
+      });
+
+      Router.start();
+    } catch (err) {
+      console.error('Load error:', err);
+      showError(appMain, 'Failed to load your data. Please check your internet connection and try again.');
+    }
+  }
+
+  function registerRoutes() {
     Router.addRoute('/', function() {
       showView(Views.CameraList, {}, 'Roll Notes', false, settingsBtn());
     });
@@ -61,8 +136,6 @@ window.RollNotes = window.RollNotes || {};
     Router.addRoute('/settings', function() {
       showView(Views.Settings, {}, 'Settings', true, '');
     });
-
-    Router.start();
   }
 
   function showView(view, params, title, showBack, actionsHtml) {
@@ -111,11 +184,19 @@ window.RollNotes = window.RollNotes || {};
     }, 2500);
   }
 
+  function showLoading(el) {
+    el.innerHTML = '<div class="loading-state"><div class="spinner"></div></div>';
+  }
+
+  function showError(el, message) {
+    el.innerHTML = '<div class="error-state"><p>' + message + '</p>' +
+      '<button class="btn btn-primary" onclick="location.reload()">Try Again</button></div>';
+  }
+
   // Expose globally
   RollNotes.updateMemberBadge = updateMemberBadge;
   RollNotes.toast = toast;
 
-  // Init on DOM ready
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', init);
   } else {

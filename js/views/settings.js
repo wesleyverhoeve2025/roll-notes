@@ -62,6 +62,19 @@ window.RollNotes.Views.Settings = (function() {
 
     html += '</div></div>';
 
+    // Account section
+    var user = RollNotes.Auth.getUser();
+    html += '<div class="settings-section">' +
+      '<h2>Account</h2>' +
+      '<div class="setting-row">' +
+        '<div>' +
+          '<div class="setting-label">Signed in as</div>' +
+          '<div class="setting-description">' + esc(user ? user.email : '') + '</div>' +
+        '</div>' +
+        '<button class="btn btn-secondary" id="signOutBtn">Sign Out</button>' +
+      '</div>' +
+    '</div>';
+
     container.innerHTML = html;
     bindEvents();
   }
@@ -114,6 +127,26 @@ window.RollNotes.Views.Settings = (function() {
         RollNotes.CSVExport.exportAll();
       });
     }
+
+    // Sign out
+    document.getElementById('signOutBtn').addEventListener('click', async function() {
+      this.disabled = true;
+      this.textContent = 'Signing out\u2026';
+      try {
+        await RollNotes.Auth.signOut();
+        window.location.reload();
+      } catch (err) {
+        this.disabled = false;
+        this.textContent = 'Sign Out';
+        RollNotes.toast('Sign out failed');
+      }
+    });
+  }
+
+  function esc(str) {
+    var d = document.createElement('div');
+    d.textContent = str || '';
+    return d.innerHTML;
   }
 
   function destroy() {
